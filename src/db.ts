@@ -17,6 +17,17 @@ export class Database {
         }
     }
 
+    async getLastNonce(): Promise<number> {
+        return this.withClient(async (client) => {
+            const result = await client.query<QueuedPingEvent>(
+                'SELECT pong_tx_nonce FROM ping_events WHERE pong_tx_nonce IS NOT NULL ORDER BY pong_tx_nonce DESC LIMIT 1',
+            );  
+            if(result.rows.length==0)
+                return 0;
+            return result.rows[0].pong_tx_nonce??0;
+        });
+    }
+    
     async getUnprocessedEvents(): Promise<QueuedPingEvent[]> {
         return this.withClient(async (client) => {
             const result = await client.query<QueuedPingEvent>(

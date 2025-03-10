@@ -162,7 +162,7 @@ class EventQueue {
   private async sendReplacementTransaction(
     event: QueuedPingEvent
   ): Promise<ethers.TransactionReceipt> {
-    if (!event.pong_tx_hash || !event.pong_tx_nonce) {
+    if (!event.pong_tx_hash || event.pong_tx_nonce==null) {
       throw new Error(
         "Cannot send replacement: missing transaction hash or nonce"
       );
@@ -188,7 +188,7 @@ class EventQueue {
       to: await this.contract.getAddress(),
       data: this.contract.interface.encodeFunctionData("pong", [event.tx_hash]),
       nonce: event.pong_tx_nonce,
-      gasPrice: gasPrice * 2n, // Double current gas price for replacement
+      gasPrice: gasPrice * 120n/100n, // 20% more than current gas price for replacement
     });
 
     // Update DB with replacement transaction and new block number
@@ -292,10 +292,7 @@ class EventQueue {
                 });
 
                 if (parsedLog && parsedLog.args) {
-                  // Get the txHash parameter which is the only parameter in the Pong event
                   const eventTxHash = parsedLog.args.txHash.toLowerCase();
-
-                  // Check if the hash matches
                   if (eventTxHash === normalizedPingTxHash) {
                     // Get the full transaction to check sender
                     const tx = await this.provider.getTransaction(
@@ -314,7 +311,7 @@ class EventQueue {
                       await this.db.updatePongTransaction(
                         pingTxHash,
                         tx.hash,
-                        await tx.nonce,
+                        tx.nonce,
                         log.blockNumber
                       );
 
@@ -323,12 +320,7 @@ class EventQueue {
                       console.log(
                         `Marked ${pingTxHash} as processed based on found pong transaction ${tx.hash}`
                       );
-
                       return true;
-                    } else if (tx) {
-                      console.log(
-                        `Found pong event with matching hash but from wrong address: ${tx.from} (we want: ${this.ourAddress})`
-                      );
                     }
                   }
                 }
@@ -337,22 +329,13 @@ class EventQueue {
                 // Continue checking other logs in this chunk
               }
             }
-          } else {
-            console.log(
-              `No Pong events found in blocks ${fromBlockAdjusted}-${toBlock}`
-            );
           }
         } catch (error) {
           console.warn(
             `Error searching blocks ${fromBlockAdjusted}-${toBlock}: ${error}`
           );
-          // Continue with next chunk even if this one fails
         }
       }
-
-      console.log(
-        `No matching pong event found for ping tx ${pingTxHash} from our address ${this.ourAddress}`
-      );
       return false;
     } catch (error) {
       console.error(`Error checking pong event logs: ${error}`);
@@ -386,10 +369,7 @@ class EventQueue {
         } seconds, sending replacement`
       );
       try {
-        // Store the nonce for replacement
         event.pong_tx_nonce = tx.nonce;
-
-        // Send replacement transaction
         const replacementReceipt = await this.sendReplacementTransaction(event);
         return { receipt: replacementReceipt };
       } catch (error) {
@@ -397,7 +377,6 @@ class EventQueue {
         throw error;
       }
     }
-
     return { receipt };
   }
 
@@ -433,6 +412,10 @@ class EventQueue {
 
       // Check if transaction is stuck (more than BLOCK_THRESHOLD blocks old)
       if (event.pong_tx_nonce !== null && event.pong_tx_block !== null) {
+        const tx = await this.provider.getTransaction(event.pong_tx_hash)
+        console.log("TX",tx)
+        if(!tx)
+            return false
         const currentBlock = await this.provider.getBlock("latest");
         if (!currentBlock) throw new Error("Could not get current block");
 
@@ -488,22 +471,47 @@ class EventQueue {
     try {
       // Check if a pong event has already been emitted for this ping
       // and update the database if found
-      const pongEventFound = await this.checkPongEventInLogs(
-        event.tx_hash,
-        event.block_number
-      );
-      if (pongEventFound) {
-        return; // Event was found and database was updated
-      }
+     
 
       // Check if there's a pending transaction
-      if (event.pong_tx_hash && !event.processed) {
-        const handled = await this.processPendingTx(event);
-        if (handled) {
-          return; // Transaction was handled, no further action needed
+      if (event.pong_tx_hash) {
+        try {
+          const handled = await this.processPendingTx(event);
+          if (handled) {
+            return; // Transaction was handled, no further action needed
+          }
+          else{
+            const pongEventFound = await this.checkPongEventInLogs(
+              event.tx_hash,
+              event.block_number
+            );
+            if (pongEventFound) {
+              return; // Event was found and database was updated
+            }
+          }
+        } catch (error) {
+          console.error(`Error processing pending transaction: ${error}`);
+          throw error;
+        }
+      }
+      else{
+        const pongEventFound = await this.checkPongEventInLogs(
+          event.tx_hash,
+          event.block_number
+        );
+        if (pongEventFound) {
+          return; // Event was found and database was updated
         }
       }
 
+      //Check that the last nonce on the db and the current nonce of the wallet are consecutive
+      const lastNonce = await this.db.getLastNonce();
+      const currentNonce = await this.provider.getTransactionCount(this.ourAddress);
+      if(Number(lastNonce)+1!==Number(currentNonce)){
+        console.log(`Last nonce ${lastNonce} is not equal to the current nonce ${currentNonce}, sending replacement`)
+        event.pong_tx_nonce=currentNonce
+        await this.sendReplacementTransaction(event);
+      }
       // Send new pong transaction
       console.log(`Sending new pong transaction for ping ${event.tx_hash}...`);
 
@@ -526,7 +534,7 @@ class EventQueue {
       await this.db.updatePongTransaction(
         event.tx_hash,
         tx.hash,
-        await tx.nonce,
+        tx.nonce,
         currentBlock.number
       );
       console.log(
@@ -537,6 +545,9 @@ class EventQueue {
 
       // Wait for transaction confirmation and replace if needed
       try {
+        event.pong_tx_block=currentBlock.number
+        event.pong_tx_nonce=tx.nonce
+        event.pong_tx_hash=tx.hash
         await this.waitAndReplace(tx, event, this.TX_CONFIRMATION_TIMEOUT);
         // If not handled by replacement and we have a receipt, mark as processed
 
