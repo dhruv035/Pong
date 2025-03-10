@@ -1,0 +1,15 @@
+# Node.js dependencies
+node_modules/
+
+# Build artifacts
+dist/
+
+pnpm-lock.yaml
+# Environment variables (containing DB credentials and private keys)
+.env
+
+# Logs
+*.log
+
+# PostgreSQL data directories if running locally
+pgdata/ 
