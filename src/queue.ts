@@ -77,13 +77,13 @@ class EventQueue {
         this.isProcessing = true;
 
         try {
-            while (this.queue.length > 0) {
+        while (this.queue.length > 0) {
                 const event = this.queue[0];
-                try {
-                    await this.processEvent(event);
-                    this.queue.shift();
-                } catch (error) {
-                    console.error('Error processing event:', error);
+            try {
+                await this.processEvent(event);
+                this.queue.shift();
+            } catch (error) {
+                console.error('Error processing event:', error);
                     // Wait a bit before retrying
                     await new Promise(resolve => setTimeout(resolve, 1000));
                 }
@@ -188,9 +188,9 @@ class EventQueue {
      * by our wallet address
      * @param pingTxHash The transaction hash of the ping event to check for
      * @param startBlock Optional block number to start the search from
-     * @returns True if a matching pong event was found, false otherwise
+     * @returns The transaction details and block number if a matching pong event was found, null otherwise
      */
-    async checkPongEventInLogs(pingTxHash: string, startBlock?: number): Promise<boolean> {
+    async checkPongEventInLogs(pingTxHash: string, startBlock?: number): Promise<{ tx: ethers.TransactionResponse, blockNumber: number } | null> {
         try {
             const wallet = this.contract.runner as ethers.Wallet;
             if (!wallet.provider) throw new Error('No provider available');
@@ -260,8 +260,12 @@ class EventQueue {
                                         // Get the full transaction to check sender
                                         const tx = await provider.getTransaction(log.transactionHash);
                                         if (tx && tx.from && tx.from.toLowerCase() === ourAddress.toLowerCase()) {
-                                            console.log(`Found matching pong event for ping tx ${pingTxHash} in transaction ${log.transactionHash} from our address ${ourAddress}`);
-                                            return true; // Early return as soon as we find a match
+                                            console.log(`Found matching pong event for ping tx ${pingTxHash} in transaction ${log.transactionHash} from our address ${ourAddress} at block ${log.blockNumber}`);
+                                            // Return both the transaction and the block number from the log
+                                            return { 
+                                                tx,
+                                                blockNumber: log.blockNumber 
+                                            };
                                         } else if (tx) {
                                             console.log(`Found pong event with matching hash but from wrong address: ${tx.from} (we want: ${ourAddress})`);
                                         }
@@ -282,24 +286,33 @@ class EventQueue {
             }
             
             console.log(`No matching pong event found for ping tx ${pingTxHash} from our address ${ourAddress}`);
-            return false;
+            return null;
         } catch (error) {
             console.error(`Error checking pong event logs: ${error}`);
-            return false;
+            return null;
         }
     }
 
     async processEvent(event: QueuedPingEvent) {
         try {
             // Check if a pong event has already been emitted for this ping
-            console.log("BLOCK_NUMBER", event.block_number);
-            const pongEventEmitted = await this.checkPongEventInLogs(event.tx_hash, event.block_number);
-            console.log(`Pong event emitted for ping ${event.tx_hash}: ${pongEventEmitted}`);
+            const result = await this.checkPongEventInLogs(event.tx_hash, event.block_number);
             
-            if (pongEventEmitted) {
-                // If a pong event exists on-chain, mark it as processed in our database
+            if (result) {
+                const { tx: pongTx, blockNumber } = result;
+                console.log(`Found pong transaction ${pongTx.hash} for ping ${event.tx_hash} at block ${blockNumber}`);
+                
+                // Update our database with transaction details
+                await this.db.updatePongTransaction(
+                    event.tx_hash,
+                    pongTx.hash,
+                    await pongTx.nonce, 
+                    blockNumber
+                );
+                
+                // Mark the event as processed
                 await this.db.markEventAsProcessed(event.tx_hash);
-                console.log(`Marked ${event.tx_hash} as processed based on on-chain event`);
+                console.log(`Marked ${event.tx_hash} as processed based on found pong transaction ${pongTx.hash}`);
                 return;
             }
             
