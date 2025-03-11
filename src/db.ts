@@ -16,11 +16,18 @@ export class Database {
             client.release();
         }
     }
-
+    async updateTransactionHash(pingTxHash: string, pongTxHash: string): Promise<void> {
+        return this.withClient(async (client) => {
+            await client.query(
+                'UPDATE ping_events SET pong_tx_hash = $1 WHERE tx_hash = $2',
+                [pongTxHash, pingTxHash]
+            );
+        });
+    }
     async getLastNonce(): Promise<number> {
         return this.withClient(async (client) => {
             const result = await client.query<QueuedPingEvent>(
-                'SELECT pong_tx_nonce FROM ping_events WHERE pong_tx_nonce IS NOT NULL ORDER BY pong_tx_nonce DESC LIMIT 1',
+                'SELECT pong_tx_nonce FROM ping_events WHERE pong_tx_nonce IS NOT NULL AND processed=true ORDER BY pong_tx_nonce DESC LIMIT 1',
             );  
             if(result.rows.length==0)
                 return 0;
@@ -57,6 +64,34 @@ export class Database {
                 'UPDATE ping_events SET pong_tx_hash = $1, pong_tx_nonce = $2, pong_tx_block = $3 WHERE tx_hash = $4',
                 [pong_tx_hash, nonce, block_number, ping_tx_hash]
             );
+        });
+    }
+
+    async updatePingEvent(
+        pingTxHash: string,
+        updates: Record<string, any>
+    ): Promise<void> {
+        return this.withClient(async (client) => {
+            // Get the field names and values from the updates object
+            const fields = Object.keys(updates);
+            if (fields.length === 0) return; // Nothing to update
+            
+            // Create the SET part of the query: "field1 = $1, field2 = $2, ..."
+            const setClause = fields
+                .map((field, index) => `${field} = $${index + 1}`)
+                .join(', ');
+            
+            // Extract the values in the same order as the fields
+            const values = fields.map(field => updates[field]);
+            
+            // Add the pingTxHash as the last parameter
+            values.push(pingTxHash);
+            
+            // Construct the final query
+            const query = `UPDATE ping_events SET ${setClause} WHERE tx_hash = $${values.length}`;
+            
+            // Execute the query
+            await client.query(query, values);
         });
     }
 
