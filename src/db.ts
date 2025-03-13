@@ -107,8 +107,8 @@ export class Database {
     return this.withTransaction(async (client) => {
       if (isReplacement || isPrepared) {
         await client.query(
-          "UPDATE pong_transactions SET status = $1, replacement_hash = $2 WHERE nonce = $3",
-          ["replacing", pongTxHash, nonce]
+          "UPDATE pong_transactions SET status = $1, replacement_hash = $2, block_number = $3 WHERE nonce = $4",
+          ["replacing", pongTxHash, blockNumber, nonce]
         );
       } else {
         await client.query(

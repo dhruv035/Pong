@@ -193,13 +193,23 @@ class EventQueue {
     if (!currentBlock) throw new Error("Could not get current block");
 
     const gasPrice = await this.waitForAcceptableGasPrice();
-    const overrides = { gasPrice: isReplacement ? gasPrice*12n/10n : gasPrice*8n/10n };
+    const overrides = { gasPrice: isReplacement ? gasPrice*12n/10n : gasPrice };
     const populatedTx = await this.populateTransaction(
       event.tx_hash,
       overrides
     );
-
+    const dbTx = await this.db.getPongTransaction(event.pong_tx_nonce!);
     console.log("populatedTx", populatedTx);
+    if(populatedTx.nonce !== event.pong_tx_nonce) {
+      if(dbTx) {
+        const tx = await this.provider.getTransactionReceipt(dbTx.tx_hash);
+        if(tx) {
+          console.log("Transaction was confirmed before replacement");
+          await this.db.confirmTransaction(tx.hash, event.pong_tx_nonce!);
+          return { receipt: tx, replace: false };
+        }
+      }
+    }
 
     await this.db.preparePongTransaction(
       event.tx_hash,
