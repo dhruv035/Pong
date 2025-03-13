@@ -3,14 +3,19 @@ import { abi } from "./abi";
 import { Database } from "./db";
 
 export type QueuedPingEvent = {
-  timestamp: number;
   tx_hash: string;
   processed: boolean;
-  pong_tx_hash: string | null;
   pong_tx_nonce: number | null;
-  pong_tx_block: number | null;
-  created_at: Date;
   block_number: number;
+};
+
+export type PongTransaction = {
+  tx_hash: string;
+  replacement_hash: string | null;
+  nonce: number | null;
+  block_number: number | null;
+  ping_hash: string;
+  status: string;
 };
 
 interface PongContract extends ethers.BaseContract {
@@ -87,6 +92,7 @@ class EventQueue {
   }
 
   async processQueue() {
+    console.log("Processing queue, queue length:", this.isProcessing);
     if (this.isProcessing) return;
     this.isProcessing = true;
 
@@ -159,438 +165,197 @@ class EventQueue {
     }
   }
 
-  private async sendReplacementTransaction(
-    event: QueuedPingEvent
-  ): Promise<ethers.TransactionReceipt> {
-    if (!event.pong_tx_hash || event.pong_tx_nonce == null) {
-      throw new Error(
-        "Cannot send replacement: missing transaction hash or nonce"
+  private async waitAndReplaceNew(
+    event: QueuedPingEvent,
+    isReplacement: boolean = false,
+    isPrepared: boolean = false
+  ) {
+    let shouldRetry = isReplacement;
+    console.log("waiting and replacing new, event, isReplacement", event, isReplacement);
+    do {
+      const { receipt, replace } = await this.sendPongTransaction(
+        event,
+        shouldRetry,
+        isPrepared
       );
-    }
-
-    console.log(
-      `Sending replacement for transaction ${event.pong_tx_hash} with nonce ${event.pong_tx_nonce}`
-    );
-
-    // Get current block number for tracking
+      if (receipt) {
+        return { receipt, replace: false };
+      }
+      shouldRetry = replace;
+    } while (shouldRetry);
+  }
+  private async sendPongTransaction(
+    event: QueuedPingEvent,
+    isReplacement: boolean,
+    isPrepared: boolean
+  ): Promise<{ receipt: ethers.TransactionReceipt | null; replace: boolean }> {
     const currentBlock = await this.provider.getBlock("latest");
     if (!currentBlock) throw new Error("Could not get current block");
 
-    // Wait for acceptable gas price
     const gasPrice = await this.waitForAcceptableGasPrice();
-    console.log(
-      `Gas price is now ${this.formatGwei(
-        gasPrice
-      )} gwei, proceeding with transaction`
-    );
-
-    const replacementTx = await this.wallet.sendTransaction({
-      to: await this.contract.getAddress(),
-      data: this.contract.interface.encodeFunctionData("pong", [event.tx_hash]),
-      nonce: event.pong_tx_nonce,
-      gasPrice: (gasPrice * 120n) / 100n, // 20% more than current gas price for replacement
-    });
-
-    // Update DB with replacement transaction and new block number
-    await this.db.updateReplacementTransaction(
+    const overrides = { gasPrice: isReplacement ? gasPrice*12n/10n : gasPrice*8n/10n };
+    const populatedTx = await this.populateTransaction(
       event.tx_hash,
-      replacementTx.hash,
-      currentBlock.number
-    );
-    console.log(
-      `Sent replacement transaction ${replacementTx.hash} with nonce ${event.pong_tx_nonce} at block ${currentBlock.number}`
+      overrides
     );
 
-    // Wait for replacement transaction with timeout and handle recursively if needed
-    const { receipt } = await this.waitAndReplace(
-      replacementTx,
-      event,
+    console.log("populatedTx", populatedTx);
+
+    await this.db.preparePongTransaction(
+      event.tx_hash,
+      populatedTx.hash,
+      populatedTx.nonce,
+      currentBlock.number,
+      isReplacement,
+      isPrepared
+    );
+    let tx: ethers.TransactionResponse | ethers.ContractTransactionResponse;
+    try {
+      // Send the exact populated transaction
+      tx = await this.wallet.sendTransaction(populatedTx);
+    } catch (error) {
+      console.error(`Error sending transaction: ${error}`);
+      return { receipt: null, replace: true };
+    }
+    console.log("sent tx", tx);
+    await this.db.updatePongTransaction(
+      populatedTx.nonce,
+      isReplacement
+        ? {
+            tx_hash: populatedTx.hash,
+            replacement_hash: null,
+          }
+        : {
+            status: "pending",
+          }
+    );
+    const receipt = await this.waitForTransactionWithTimeout(
+      tx,
       this.TX_CONFIRMATION_TIMEOUT
     );
-
-    // Update DB to mark as processed
-    return receipt;
+    if (receipt) {
+      await this.db.confirmTransaction(tx.hash, tx.nonce);
+      return { receipt, replace: false };
+    } else {
+      return { receipt: null, replace: true };
+    }
   }
-
-  /**
-   * Checks contract logs to see if a pong event has been emitted for a specific ping transaction hash
-   * by our wallet address. If found, updates the database and marks the event as processed.
-   *
-   * @param pingTxHash The transaction hash of the ping event to check for
-   * @param startBlock Optional block number to start the search from
-   * @returns True if a matching pong event was found and database updated, false otherwise
-   */
-  async checkPongEventInLogs(
-    pingTxHash: string,
-    startBlock?: number
-  ): Promise<boolean> {
+  async processTxHash(event: QueuedPingEvent, nonce: number) {
     try {
-      // Normalize the input hash for comparison
-      const normalizedPingTxHash = pingTxHash.toLowerCase().startsWith("0x")
-        ? pingTxHash.toLowerCase()
-        : `0x${pingTxHash.toLowerCase()}`;
-
-      console.log(
-        `Checking logs for pong event matching ping tx hash ${normalizedPingTxHash} from our address ${this.ourAddress}...`
-      );
-
-      // Get current block number
+      const dbTx = await this.db.getPongTransaction(nonce);
       const currentBlock = await this.provider.getBlock("latest");
       if (!currentBlock) throw new Error("Could not get current block");
-
-      // Use the startBlock parameter if provided, otherwise use a default lookback
-      const minBlock = startBlock
-        ? startBlock
-        : Math.max(0, currentBlock.number - 2000);
-      console.log(`Starting search from block ${minBlock}`);
-
-      // Maximum blocks to query in one call (provider limit)
-      const maxBlockRange = 500;
-
-      // Define the event to look for according to the ABI
-      const eventSignature = "Pong(bytes32)";
-      const contractAddress = await this.contract.getAddress();
-
-      // Search logs in chunks and process each chunk immediately
-      // Start from the most recent blocks and go backwards
-      for (
-        let fromBlock = currentBlock.number;
-        fromBlock > minBlock;
-        fromBlock = fromBlock - maxBlockRange
-      ) {
-        const toBlock = fromBlock;
-        const fromBlockAdjusted = Math.max(
-          minBlock,
-          fromBlock - maxBlockRange + 1
-        );
-
-        console.log(`Searching blocks ${fromBlockAdjusted} to ${toBlock}...`);
-
-        try {
-          const filter = {
-            address: contractAddress,
-            topics: [ethers.id(eventSignature)],
-            fromBlock: fromBlockAdjusted,
-            toBlock: toBlock,
-          };
-
-          const logs = await this.provider.getLogs(filter);
-
-          if (logs.length > 0) {
-            console.log(
-              `Found ${logs.length} Pong events in blocks ${fromBlockAdjusted}-${toBlock}, checking for matches...`
-            );
-
-            // Process logs in reverse order (newest first) for higher chance of finding recent matches
-            for (let i = logs.length - 1; i >= 0; i--) {
-              const log = logs[i];
-              try {
-                // Parse the log according to the event structure
-                const parsedLog = this.contract.interface.parseLog({
-                  topics: log.topics as string[],
-                  data: log.data,
-                });
-
-                if (parsedLog && parsedLog.args) {
-                  const eventTxHash = parsedLog.args.txHash.toLowerCase();
-                  if (eventTxHash === normalizedPingTxHash) {
-                    // Get the full transaction to check sender
-                    const tx = await this.provider.getTransaction(
-                      log.transactionHash
-                    );
-                    if (
-                      tx &&
-                      tx.from &&
-                      tx.from.toLowerCase() === this.ourAddress.toLowerCase()
-                    ) {
-                      console.log(
-                        `Found matching pong event for ping tx ${pingTxHash} in transaction ${log.transactionHash} from our address ${this.ourAddress} at block ${log.blockNumber}`
-                      );
-
-                      // Update database with transaction details
-                      await this.db.updatePongTransaction(
-                        pingTxHash,
-                        tx.hash,
-                        tx.nonce,
-                        log.blockNumber
-                      );
-
-                      // Mark the event as processed
-                      await this.db.markEventAsProcessed(pingTxHash);
-                      console.log(
-                        `Marked ${pingTxHash} as processed based on found pong transaction ${tx.hash}`
-                      );
-                      return true;
-                    }
-                  }
-                }
-              } catch (error) {
-                console.warn(`Error parsing log: ${error}`);
-                // Continue checking other logs in this chunk
-              }
+      if (!dbTx) {
+        throw new Error("Transaction not found");
+      }
+      const tx = await this.provider.getTransaction(dbTx.tx_hash);
+      if (!tx) {
+        if (dbTx.status === "replacing") {
+          const replacementTx = await this.provider.getTransaction(
+            dbTx.replacement_hash!
+          );
+          if (!replacementTx) {
+            const nonce = await this.wallet.getNonce();
+            console.log("nonce", nonce);
+            console.log("dbTx.nonce", dbTx.nonce);
+            if (nonce !== dbTx.nonce) {
+              throw new Error("Transaction has a different nonce, aborting");
             }
+            try {
+              await this.waitAndReplaceNew(event);
+            } catch (error) {
+              console.error(`Error waiting for transaction: ${error}`);
+              throw error;
+            }
+          } else if (replacementTx.blockNumber) {
+            await this.db.confirmTransaction(
+              replacementTx.hash,
+              replacementTx.nonce
+            );
+          } else {
+            console.log(
+              `Replacement transaction ${dbTx.replacement_hash} is still pending, waiting...`
+            );
+            const blockDiff = currentBlock.number - dbTx.block_number!;
+            await this.processPendingTransaction(replacementTx, event,blockDiff);
           }
-        } catch (error) {
-          console.warn(
-            `Error searching blocks ${fromBlockAdjusted}-${toBlock}: ${error}`
+        }
+
+       else {  if (dbTx.status === "preparing") {
+          console.log(
+            `Transaction ${dbTx.tx_hash} was not sent, preparing new transaction...`
+          );
+        } else if (dbTx.status === "pending") {
+          console.log(
+            `Transaction ${dbTx.tx_hash} was dropped, preparing new transaction...`
           );
         }
+        const nonce = await this.wallet.getNonce();
+        console.log("nonce", nonce);
+        console.log("dbTx.nonce", dbTx.nonce);
+        if (nonce !== Number(dbTx.nonce)) {
+          throw new Error("Transaction has a different nonce, aborting");
+        }
+        try {
+          await this.waitAndReplaceNew(event,false,true);
+        } catch (error) {
+          console.error(`Error waiting for transaction: ${error}`);
+          throw error;
+        }}
+      } else if (tx.blockNumber) {
+        console.log("TX   ", tx);
+        console.log(
+          `Transaction ${dbTx.tx_hash} was mined, updating database...`
+        );
+        console.log("TX hash", tx.hash);
+        console.log("TX nonce", tx.nonce);
+        await this.db.confirmTransaction(tx.hash, tx.nonce);
+        console.log("TX updated", event.pong_tx_nonce);
+      } else {
+        console.log(`Transaction ${dbTx.tx_hash} is still pending, waiting...`);
+        const blockDiff = currentBlock.number - dbTx.block_number!;
+        await this.processPendingTransaction(tx, event,blockDiff);
       }
-      return false;
     } catch (error) {
-      console.error(`Error checking pong event logs: ${error}`);
-      return false;
+      console.error(`Error processing transaction: ${error}`);
+      throw error;
     }
   }
 
-  /**
-   * Wait for a transaction to be confirmed with a timeout, and replace it if it times out
-   * @param tx The transaction to wait for
-   * @param event The event associated with the transaction
-   * @param timeout The timeout in milliseconds
-   * @returns An object with receipt (if confirmed) and whether the transaction was handled
-   */
-  private async waitAndReplace(
+  async processPendingTransaction(
     tx: ethers.TransactionResponse | ethers.ContractTransactionResponse,
     event: QueuedPingEvent,
-    timeout: number
-  ): Promise<{ receipt: ethers.TransactionReceipt }> {
-    console.log(
-      `Waiting for transaction ${tx.hash} to be mined (timeout: ${
-        timeout / 1000
-      }s)...`
+    blockDiff: number
+  ) {
+    console.log("processing pending transaction", tx, event, blockDiff);
+    const currentBlock = await this.provider.getBlock("latest");
+    if (!currentBlock) throw new Error("Could not get current block");
+    const receipt = await this.waitForTransactionWithTimeout(
+      tx,
+      blockDiff<this.BLOCK_THRESHOLD ? 12000*(this.BLOCK_THRESHOLD-blockDiff) : 0
     );
-    const receipt = await this.waitForTransactionWithTimeout(tx, timeout);
-
-    if (!receipt) {
-      console.log(
-        `Transaction ${tx.hash} timed out after ${
-          timeout / 1000
-        } seconds, sending replacement`
-      );
-      try {
-        event.pong_tx_nonce = tx.nonce;
-        const replacementReceipt = await this.sendReplacementTransaction(event);
-        return { receipt: replacementReceipt };
-      } catch (error) {
-        console.error(`Error sending replacement transaction: ${error}`);
-        throw error;
-      }
-    }
-    return { receipt };
-  }
-
-  /**
-   * Process a pending transaction for an event
-   * Checks if the transaction is confirmed, stuck, or still pending
-   * @param event The event with a pending transaction to process
-   * @returns True if the event was fully processed and no further action is needed
-   */
-  private async processPendingTx(event: QueuedPingEvent): Promise<boolean> {
-    if (!event.pong_tx_hash) {
-      return false; // No pending transaction to process
-    }
-
-    console.log(
-      `Found pending transaction ${event.pong_tx_hash} for ping ${event.tx_hash}`
-    );
-
-    try {
-      // Check if the transaction is already confirmed
-      const pendingReceipt = await this.provider.getTransactionReceipt(
-        event.pong_tx_hash
-      );
-
-      if (pendingReceipt) {
-        // Transaction was mined, update as processed
-        await this.db.markEventAsProcessed(event.tx_hash);
-        console.log(
-          `Found and confirmed pending transaction ${event.pong_tx_hash}`
-        );
-        return true; // Event fully processed
-      }
-
-      // Check if transaction is stuck (more than BLOCK_THRESHOLD blocks old)
-      if (event.pong_tx_nonce !== null && event.pong_tx_block !== null) {
-        const tx = await this.provider.getTransaction(event.pong_tx_hash);
-        console.log("TX", tx);
-        if (!tx) return false;
-        const currentBlock = await this.provider.getBlock("latest");
-        if (!currentBlock) throw new Error("Could not get current block");
-
-        const blockDifference = currentBlock.number - event.pong_tx_block;
-
-        if (blockDifference > this.BLOCK_THRESHOLD) {
-          console.log(
-            `Transaction ${event.pong_tx_hash} is ${blockDifference} blocks old, replacing...`
-          );
-          try {
-            await this.sendReplacementTransaction(event);
-          } catch (error) {
-            console.error(`Error sending replacement transaction: ${error}`);
-            throw error;
-          }
-          return true; // Event handled with replacement transaction
-        } else {
-          console.log(
-            `Transaction ${event.pong_tx_hash} is only ${blockDifference} blocks old, waiting...`
-          );
-          const tx = await this.provider.getTransaction(event.pong_tx_hash);
-          if (!tx) throw new Error("Transaction not found");
-
-          const timeout = (this.BLOCK_THRESHOLD - blockDifference + 1) * 12000;
-
-          try {
-            await this.waitAndReplace(tx, event, timeout);
-            // Transaction was confirmed while waiting
-            await this.db.markEventAsProcessed(event.tx_hash);
-            console.log(
-              `Confirmed pending transaction ${event.pong_tx_hash} after waiting`
-            );
-            return true; // Event fully processed
-          } catch (error) {
-            console.error(`Error waiting for transaction: ${error}`);
-            throw error;
-          }
-        }
-      }
-
-      // If we get here, we have a pending tx_hash but no nonce/block info
-      console.log(
-        `Pending transaction ${event.pong_tx_hash} doesn't have nonce/block info, treating as new`
-      );
-      return false; // Treat as unprocessed
-    } catch (error) {
-      console.log(`Error checking pending transaction: ${error}, will retry`);
-      throw error;
+    if (receipt) {
+      await this.db.confirmTransaction(tx.hash, tx.nonce);
+    } else {
+      console.log(`Transaction ${tx.hash} is stuck, sending replacement...`);
+      await this.waitAndReplaceNew(event, true);
     }
   }
 
   async processEvent(event: QueuedPingEvent) {
     try {
-      // Check if a pong event has already been emitted for this ping
-      // and update the database if found
-
+      console.log("event.pong_tx_nonce", event.pong_tx_nonce);
       // Check if there's a pending transaction
-      if (event.pong_tx_hash) {
+      if (event.pong_tx_nonce) {
         try {
-          const handled = await this.processPendingTx(event);
-          if (handled) {
-                    return; // Transaction was handled, no further action needed
-            } else {
-                const pongEventFound = await this.checkPongEventInLogs(
-                    event.tx_hash,
-                    event.block_number
-                );
-                if (pongEventFound) {
-                    return; // Event was found and database was updated
-                }
-            }
+          await this.processTxHash(event, event.pong_tx_nonce);
         } catch (error) {
-          console.error(`Error processing pending transaction: ${error}`);
+          console.error(`Error processing transaction: ${error}`);
           throw error;
         }
       } else {
-        if(event.tx_status == "preparing"){
-        const pongEventFound = await this.checkPongEventInLogs(
-          event.tx_hash,
-              event.block_number
-            );
-            if (pongEventFound) {
-              return; // Event was found and database was updated
-            }
-          }
-        } catch (error) {
-          console.error(`Error processing pending transaction: ${error}`);
-          throw error;
-        }
-      } else {
-        const pongEventFound = await this.checkPongEventInLogs(
-          event.tx_hash,
-          event.block_number
-        );
-        if (pongEventFound) {
-          return; // Event was found and database was updated
-        }
-      }
-
-      // Send new pong transaction
-      console.log(`Sending new pong transaction for ping ${event.tx_hash}...`);
-
-      const currentBlock = await this.provider.getBlock("latest");
-      if (!currentBlock) throw new Error("Could not get current block");
-
-      // Wait for acceptable gas price
-      const gasPrice = await this.waitForAcceptableGasPrice();
-      console.log(
-        `Gas price is now ${this.formatGwei(
-          gasPrice
-        )} gwei, proceeding with transaction`
-      );
-
-      // Override the contract's gas price for this call
-      const overrides = { gasPrice };
-      const populatedTx = await this.populateTransaction(
-        event.tx_hash,
-        overrides
-      );
-
-      // Store transaction details in the database before sending
-      await this.db.updatePingEvent(
-        event.tx_hash,
-        {
-          pong_tx_hash: populatedTx.hash,
-          pong_tx_nonce: populatedTx.nonce!,
-          pong_tx_block: currentBlock.number,
-          tx_status: "preparing",
-        }
-      );
-      console.log(
-        `Prepared ping event with transaction ${populatedTx.hash} (nonce: ${populatedTx.nonce}, block: ${currentBlock.number})`
-      );
-
-      // Now actually send the transaction
-      const tx = await this.wallet.sendTransaction({
-        to: populatedTx.to,
-        data: populatedTx.data,
-        nonce: populatedTx.nonce,
-        gasPrice: populatedTx.gasPrice,
-        gasLimit: populatedTx.gasLimit,
-      });
-
-      console.log(`Sent transaction ${tx.hash}`);
-
-      // Update DB with pending pong transaction, its nonce and block number
-      await this.db.updatePingEvent(
-        event.tx_hash,
-        {
-          pong_tx_hash: tx.hash,
-          pong_tx_nonce: tx.nonce,
-          pong_tx_block: currentBlock.number,
-          tx_status: "pending",
-        }
-      );
-      console.log(
-        `Updated ping event with pending pong transaction ${
-          tx.hash
-        } (nonce: ${await tx.nonce}, block: ${currentBlock.number})`
-      );
-
-      // Wait for transaction confirmation and replace if needed
-      try {
-        event.pong_tx_block = currentBlock.number;
-        event.pong_tx_nonce = tx.nonce;
-        event.pong_tx_hash = tx.hash;
-        await this.waitAndReplace(tx, event, this.TX_CONFIRMATION_TIMEOUT);
-        // If not handled by replacement and we have a receipt, mark as processed
-
-        await this.db.markEventAsProcessed(event.tx_hash);
-        console.log(
-          `Processed ping event ${event.tx_hash} with pong ${tx.hash}`
-        );
-      } catch (error) {
-        console.error(`Error waiting for transaction: ${error}`);
-        throw error;
+        // Send new pong transaction
+        await this.waitAndReplaceNew(event, false);
       }
     } catch (error) {
       console.error(`Error processing ping event ${event.tx_hash}:`, error);
@@ -617,11 +382,20 @@ class EventQueue {
         pingTxHash,
       ]);
 
-      // Create the transaction request
+      // Get fee data for EIP-1559
+      const feeData = await this.provider.getFeeData();
+      if (!feeData.maxFeePerGas || !feeData.maxPriorityFeePerGas) {
+        throw new Error("Could not get fee data for EIP-1559");
+      }
+
+      // Create the transaction request with EIP-1559 fields
       const txRequest: ethers.TransactionRequest = {
         to: contractAddress,
         data,
-        ...overrides,
+        type: 2, // EIP-1559
+        maxFeePerGas: overrides.gasPrice || feeData.maxFeePerGas,
+        maxPriorityFeePerGas: overrides.gasPrice || feeData.maxPriorityFeePerGas,
+        chainId: (await this.provider.getNetwork()).chainId
       };
 
       // Add missing transaction fields
@@ -638,22 +412,20 @@ class EventQueue {
         txRequest.nonce = await this.wallet.getNonce();
       }
 
-      // Sign the transaction (this gives us the hash without sending)
-      const signedTx = await this.wallet.signTransaction(txRequest);
-
-      // Parse the signed transaction to get the hash
+      // Let the wallet populate the transaction to match exactly what will be sent
+      const populatedTx = await this.wallet.populateTransaction(txRequest);
+      
+      // Get the actual transaction hash that will match the sent transaction
+      const signedTx = await this.wallet.signTransaction(populatedTx);
       const tx = ethers.Transaction.from(signedTx);
 
-      // Create a transaction response-like object
       return {
-        ...txRequest,
+        ...populatedTx,
         hash: tx.hash,
-        nonce: txRequest.nonce,
         wait: async () => {
           throw new Error("Transaction not sent yet");
         },
         confirmations: 0,
-        from: this.ourAddress,
       } as unknown as ethers.TransactionResponse;
     } catch (error) {
       console.error("Error populating transaction:", error);
