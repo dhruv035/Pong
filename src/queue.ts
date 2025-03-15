@@ -115,17 +115,27 @@ class EventQueue {
 
   private async waitForAcceptableGasPrice(
     provider: ethers.Provider = this.provider
-  ): Promise<bigint> {
+  ): Promise<{
+    gasPrice: bigint;
+    maxFeePerGas: bigint;
+    maxPriorityFeePerGas: bigint;
+  }> {
     while (true) {
       const feeData = await provider.getFeeData();
       const gasPrice = feeData.gasPrice;
+      const maxFeePerGas = feeData.maxFeePerGas;
+      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
 
       if (!gasPrice) {
         throw new Error("Could not get gas price");
       }
 
       if (gasPrice <= this.MAX_GAS_PRICE) {
-        return gasPrice;
+        return {
+          gasPrice,
+          maxFeePerGas: maxFeePerGas ?? gasPrice,
+          maxPriorityFeePerGas: maxPriorityFeePerGas ?? 0n,
+        };
       }
 
       console.log(
@@ -171,7 +181,11 @@ class EventQueue {
     isPrepared: boolean = false
   ) {
     let shouldRetry = isReplacement;
-    console.log("waiting and replacing new, event, isReplacement", event, isReplacement);
+    console.log(
+      "waiting and replacing new, event, isReplacement",
+      event,
+      isReplacement
+    );
     do {
       const { receipt, replace } = await this.sendPongTransaction(
         event,
@@ -192,18 +206,24 @@ class EventQueue {
     const currentBlock = await this.provider.getBlock("latest");
     if (!currentBlock) throw new Error("Could not get current block");
 
-    const gasPrice = await this.waitForAcceptableGasPrice();
-    const overrides = { gasPrice: isReplacement ? gasPrice*12n/10n : gasPrice };
+    const { maxFeePerGas, maxPriorityFeePerGas } =
+      await this.waitForAcceptableGasPrice();
+    const overrides = {
+      maxFeePerGas: isReplacement ? (maxFeePerGas * 12n) / 10n : maxFeePerGas,
+      maxPriorityFeePerGas: isReplacement
+        ? (maxPriorityFeePerGas * 12n) / 10n
+        : maxPriorityFeePerGas,
+    };
     const populatedTx = await this.populateTransaction(
       event.tx_hash,
       overrides
     );
     const dbTx = await this.db.getPongTransaction(event.pong_tx_nonce!);
     console.log("populatedTx", populatedTx);
-    if(populatedTx.nonce !== event.pong_tx_nonce) {
-      if(dbTx) {
+    if (populatedTx.nonce !== event.pong_tx_nonce) {
+      if (dbTx) {
         const tx = await this.provider.getTransactionReceipt(dbTx.tx_hash);
-        if(tx) {
+        if (tx) {
           console.log("Transaction was confirmed before replacement");
           await this.db.confirmTransaction(tx.hash, event.pong_tx_nonce!);
           return { receipt: tx, replace: false };
@@ -287,31 +307,35 @@ class EventQueue {
               `Replacement transaction ${dbTx.replacement_hash} is still pending, waiting...`
             );
             const blockDiff = currentBlock.number - dbTx.block_number!;
-            await this.processPendingTransaction(replacementTx, event,blockDiff);
+            await this.processPendingTransaction(
+              replacementTx,
+              event,
+              blockDiff
+            );
+          }
+        } else {
+          if (dbTx.status === "preparing") {
+            console.log(
+              `Transaction ${dbTx.tx_hash} was not sent, preparing new transaction...`
+            );
+          } else if (dbTx.status === "pending") {
+            console.log(
+              `Transaction ${dbTx.tx_hash} was dropped, preparing new transaction...`
+            );
+          }
+          const nonce = await this.wallet.getNonce();
+          console.log("nonce", nonce);
+          console.log("dbTx.nonce", dbTx.nonce);
+          if (nonce !== Number(dbTx.nonce)) {
+            throw new Error("Transaction has a different nonce, aborting");
+          }
+          try {
+            await this.waitAndReplaceNew(event, false, true);
+          } catch (error) {
+            console.error(`Error waiting for transaction: ${error}`);
+            throw error;
           }
         }
-
-       else {  if (dbTx.status === "preparing") {
-          console.log(
-            `Transaction ${dbTx.tx_hash} was not sent, preparing new transaction...`
-          );
-        } else if (dbTx.status === "pending") {
-          console.log(
-            `Transaction ${dbTx.tx_hash} was dropped, preparing new transaction...`
-          );
-        }
-        const nonce = await this.wallet.getNonce();
-        console.log("nonce", nonce);
-        console.log("dbTx.nonce", dbTx.nonce);
-        if (nonce !== Number(dbTx.nonce)) {
-          throw new Error("Transaction has a different nonce, aborting");
-        }
-        try {
-          await this.waitAndReplaceNew(event,false,true);
-        } catch (error) {
-          console.error(`Error waiting for transaction: ${error}`);
-          throw error;
-        }}
       } else if (tx.blockNumber) {
         console.log("TX   ", tx);
         console.log(
@@ -324,7 +348,7 @@ class EventQueue {
       } else {
         console.log(`Transaction ${dbTx.tx_hash} is still pending, waiting...`);
         const blockDiff = currentBlock.number - dbTx.block_number!;
-        await this.processPendingTransaction(tx, event,blockDiff);
+        await this.processPendingTransaction(tx, event, blockDiff);
       }
     } catch (error) {
       console.error(`Error processing transaction: ${error}`);
@@ -342,7 +366,9 @@ class EventQueue {
     if (!currentBlock) throw new Error("Could not get current block");
     const receipt = await this.waitForTransactionWithTimeout(
       tx,
-      blockDiff<this.BLOCK_THRESHOLD ? 12000*(this.BLOCK_THRESHOLD-blockDiff) : 0
+      blockDiff < this.BLOCK_THRESHOLD
+        ? 12000 * (this.BLOCK_THRESHOLD - blockDiff)
+        : 0
     );
     if (receipt) {
       await this.db.confirmTransaction(tx.hash, tx.nonce);
@@ -403,9 +429,10 @@ class EventQueue {
         to: contractAddress,
         data,
         type: 2, // EIP-1559
-        maxFeePerGas: overrides.gasPrice || feeData.maxFeePerGas,
-        maxPriorityFeePerGas: overrides.gasPrice || feeData.maxPriorityFeePerGas,
-        chainId: (await this.provider.getNetwork()).chainId
+        maxFeePerGas: overrides.maxFeePerGas??feeData.maxFeePerGas,
+        maxPriorityFeePerGas:
+          overrides.maxPriorityFeePerGas?? feeData.maxPriorityFeePerGas,
+        chainId: (await this.provider.getNetwork()).chainId,
       };
 
       // Add missing transaction fields
@@ -415,7 +442,7 @@ class EventQueue {
           data: data,
           from: this.ourAddress,
         });
-        txRequest.gasLimit = (estimatedGas * 12n) / 10n; // Add 20% buffer
+        txRequest.gasLimit = estimatedGas; // Add 20% buffer
       }
 
       if (!txRequest.nonce) {
@@ -424,7 +451,7 @@ class EventQueue {
 
       // Let the wallet populate the transaction to match exactly what will be sent
       const populatedTx = await this.wallet.populateTransaction(txRequest);
-      
+
       // Get the actual transaction hash that will match the sent transaction
       const signedTx = await this.wallet.signTransaction(populatedTx);
       const tx = ethers.Transaction.from(signedTx);
