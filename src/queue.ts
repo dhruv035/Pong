@@ -1,6 +1,23 @@
 import { ethers } from "ethers";
-import { abi } from "./abi";
 import { Database } from "./db";
+import { abi } from "./abi";
+import {
+  getContract,
+  PublicClient,
+  keccak256,
+  WalletClient,
+  createWalletClient,
+  webSocket,
+  createPublicClient,
+  TransactionReceipt,
+  encodeFunctionData,
+  TransactionSerializable,
+  parseTransaction,
+  serializeTransaction,
+  Transaction,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { sepolia } from "viem/chains";
 
 export type QueuedPingEvent = {
   tx_hash: string;
@@ -28,34 +45,25 @@ interface PongContract extends ethers.BaseContract {
 class EventQueue {
   private queue: QueuedPingEvent[] = [];
   private isProcessing: boolean = false;
-  private contract: PongContract;
+  private publicClient: PublicClient;
+  private walletClient: WalletClient;
   private db: Database;
   private cleanup: (() => Promise<void>) | null = null;
   private BLOCK_THRESHOLD = 5; // Number of blocks to wait before replacement
   private readonly MAX_GAS_PRICE = 250n * 1000000000n; // 250 gwei
   private readonly GAS_PRICE_CHECK_DELAY = 12000; // 12 seconds in milliseconds
   private readonly TX_CONFIRMATION_TIMEOUT = 60000; // 60 seconds timeout for transaction confirmation
-  private wallet: ethers.Wallet;
-  private provider: ethers.Provider;
-  private ourAddress: string;
 
   constructor(db: Database) {
     this.db = db;
-    const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-    this.provider = provider;
-
-    const wallet = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
-    this.wallet = wallet;
-    this.ourAddress = wallet.address;
-
-    // Initialize contract with signer
-    this.contract = new ethers.Contract(
-      process.env.CONTRACT_ADDRESS!,
-      abi,
-      wallet
-    ) as unknown as PongContract;
-
-    console.log(`Initialized with wallet address: ${this.ourAddress}`);
+    this.publicClient = createPublicClient({
+      chain: sepolia,
+      transport: webSocket(process.env.SEPOLIA_RPC_URL!),
+    });
+    this.walletClient = createWalletClient({
+      account: privateKeyToAccount(process.env.PRIVATE_KEY! as `0x${string}`),
+      transport: webSocket(process.env.SEPOLIA_RPC_URL!),
+    });
   }
 
   async initialize() {
@@ -113,12 +121,10 @@ class EventQueue {
     }
   }
 
-  private async waitForAcceptableGasPrice(
-    provider: ethers.Provider = this.provider
-  ): Promise<bigint> {
+  private async waitForAcceptableGasPrice(): Promise<bigint> {
     while (true) {
-      const feeData = await provider.getFeeData();
-      const gasPrice = feeData.gasPrice;
+      const { maxFeePerGas } = await this.publicClient.estimateFeesPerGas();
+      const gasPrice = maxFeePerGas;
 
       if (!gasPrice) {
         throw new Error("Could not get gas price");
@@ -146,9 +152,9 @@ class EventQueue {
   }
 
   private async waitForTransactionWithTimeout(
-    tx: ethers.TransactionResponse | ethers.ContractTransactionResponse,
+    txHash: string,
     timeoutMs: number
-  ): Promise<ethers.TransactionReceipt | null> {
+  ): Promise<TransactionReceipt | null> {
     try {
       // Create a promise that resolves after the timeout
       const timeoutPromise = new Promise<null>((resolve) => {
@@ -156,7 +162,12 @@ class EventQueue {
       });
 
       // Race between the transaction confirmation and the timeout
-      const receipt = await Promise.race([tx.wait(), timeoutPromise]);
+      const receipt = await Promise.race([
+        this.publicClient.waitForTransactionReceipt({
+          hash: txHash as `0x${string}`,
+        }),
+        timeoutPromise,
+      ]);
 
       return receipt;
     } catch (error) {
@@ -171,7 +182,11 @@ class EventQueue {
     isPrepared: boolean = false
   ) {
     let shouldRetry = isReplacement;
-    console.log("waiting and replacing new, event, isReplacement", event, isReplacement);
+    console.log(
+      "waiting and replacing new, event, isReplacement",
+      event,
+      isReplacement
+    );
     do {
       const { receipt, replace } = await this.sendPongTransaction(
         event,
@@ -188,24 +203,53 @@ class EventQueue {
     event: QueuedPingEvent,
     isReplacement: boolean,
     isPrepared: boolean
-  ): Promise<{ receipt: ethers.TransactionReceipt | null; replace: boolean }> {
-    const currentBlock = await this.provider.getBlock("latest");
+  ): Promise<{ receipt: TransactionReceipt | null; replace: boolean }> {
+    const currentBlock = Number(await this.publicClient.getBlockNumber());
     if (!currentBlock) throw new Error("Could not get current block");
 
+    const contract = getContract({
+      address: process.env.CONTRACT_ADDRESS! as `0x${string}`,
+      abi,
+      client: this.walletClient,
+    });
     const gasPrice = await this.waitForAcceptableGasPrice();
-    const overrides = { gasPrice: isReplacement ? gasPrice*12n/10n : gasPrice };
-    const populatedTx = await this.populateTransaction(
-      event.tx_hash,
-      overrides
-    );
+    const overrides = {
+      gasPrice: isReplacement ? (gasPrice * 12n) / 10n : gasPrice,
+    };
+    const serializedTx = await this.populateTransaction(event.tx_hash, overrides);
+
+    const signedTx = parseTransaction(serializedTx);
+    const txHash = keccak256(serializedTx);
+
+    console.log("txHash", txHash);
+
     const dbTx = await this.db.getPongTransaction(event.pong_tx_nonce!);
-    console.log("populatedTx", populatedTx);
-    if(populatedTx.nonce !== event.pong_tx_nonce) {
-      if(dbTx) {
-        const tx = await this.provider.getTransactionReceipt(dbTx.tx_hash);
-        if(tx) {
+    if (!signedTx.nonce) {
+      throw new Error("Transaction nonce is undefined");
+    }
+    if (signedTx.nonce !== event.pong_tx_nonce) {
+      if (dbTx) {
+        let tx: TransactionReceipt | undefined;
+        try {
+          tx = await this.publicClient.getTransactionReceipt({
+            hash: dbTx.tx_hash as `0x${string}`,
+          });
+        } catch (error) {
+          if (  
+            error instanceof Error &&
+            error.message.includes("could not be found")
+          ) {
+            console.log(`Transaction receipt not found: ${error}`);
+          } else {
+            throw error;
+          }
+        }
+        if (tx) {
           console.log("Transaction was confirmed before replacement");
-          await this.db.confirmTransaction(tx.hash, event.pong_tx_nonce!);
+          await this.db.confirmTransaction(
+            tx.transactionHash,
+            event.pong_tx_nonce!
+          );
           return { receipt: tx, replace: false };
         }
       }
@@ -213,26 +257,29 @@ class EventQueue {
 
     await this.db.preparePongTransaction(
       event.tx_hash,
-      populatedTx.hash,
-      populatedTx.nonce,
-      currentBlock.number,
+      txHash,
+      signedTx.nonce,
+      currentBlock,
       isReplacement,
       isPrepared
     );
-    let tx: ethers.TransactionResponse | ethers.ContractTransactionResponse;
+    let tx: TransactionReceipt | undefined;
+
     try {
       // Send the exact populated transaction
-      tx = await this.wallet.sendTransaction(populatedTx);
+      const txHash = await this.walletClient.sendRawTransaction({
+        serializedTransaction: serializedTx,
+      });
     } catch (error) {
       console.error(`Error sending transaction: ${error}`);
       return { receipt: null, replace: true };
     }
     console.log("sent tx", tx);
     await this.db.updatePongTransaction(
-      populatedTx.nonce,
+      signedTx.nonce,
       isReplacement
         ? {
-            tx_hash: populatedTx.hash,
+            tx_hash: txHash,
             replacement_hash: null,
           }
         : {
@@ -240,11 +287,11 @@ class EventQueue {
           }
     );
     const receipt = await this.waitForTransactionWithTimeout(
-      tx,
+      txHash,
       this.TX_CONFIRMATION_TIMEOUT
     );
     if (receipt) {
-      await this.db.confirmTransaction(tx.hash, tx.nonce);
+      await this.db.confirmTransaction(receipt.transactionHash, signedTx.nonce);
       return { receipt, replace: false };
     } else {
       return { receipt: null, replace: true };
@@ -253,26 +300,58 @@ class EventQueue {
   async processTxHash(event: QueuedPingEvent, nonce: number) {
     try {
       const dbTx = await this.db.getPongTransaction(nonce);
-      const currentBlock = await this.provider.getBlock("latest");
+      const currentBlock = await this.publicClient.getBlockNumber();
       if (!currentBlock) throw new Error("Could not get current block");
       if (!dbTx) {
         throw new Error("Transaction not found");
       }
-      const tx = await this.provider.getTransaction(dbTx.tx_hash);
-      if (!tx) {
+
+      let txReceipt: TransactionReceipt | undefined;
+      try {
+        txReceipt = await this.publicClient.getTransactionReceipt({
+          hash: dbTx.tx_hash as `0x${string}`,
+        });
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.includes("could not be found")
+        ) {
+          console.log(`Transaction receipt not found: ${error}`);
+        } else {
+          throw error;
+        }
+      }
+      if (!txReceipt) {
+        console.log("Transaction receipt not found, checking status");
         if (dbTx.status === "replacing") {
-          const replacementTx = await this.provider.getTransaction(
-            dbTx.replacement_hash!
-          );
+          let replacementTx: Transaction | undefined;
+          try {
+            replacementTx = await this.publicClient.getTransaction({
+              hash: dbTx.replacement_hash! as `0x${string}`,
+            });
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              error.message.includes("could not be found")
+            ) {
+              console.log(`Error getting replacement transaction: ${error}`);
+            } else {
+              throw error;
+            }
+          }
           if (!replacementTx) {
-            const nonce = await this.wallet.getNonce();
+            const nonce = Number(
+              await this.publicClient.getTransactionCount({
+                address: this.walletClient.account!.address,
+              })
+            );
             console.log("nonce", nonce);
             console.log("dbTx.nonce", dbTx.nonce);
-            if (nonce !== dbTx.nonce) {
+            if (nonce !== Number(dbTx.nonce)) {
               throw new Error("Transaction has a different nonce, aborting");
             }
             try {
-              await this.waitAndReplaceNew(event);
+              await this.waitAndReplaceNew(event, true, false);
             } catch (error) {
               console.error(`Error waiting for transaction: ${error}`);
               throw error;
@@ -286,45 +365,60 @@ class EventQueue {
             console.log(
               `Replacement transaction ${dbTx.replacement_hash} is still pending, waiting...`
             );
-            const blockDiff = currentBlock.number - dbTx.block_number!;
-            await this.processPendingTransaction(replacementTx, event,blockDiff);
+            const blockDiff = Number(currentBlock) - Number(dbTx.block_number);
+            await this.processPendingTransaction(
+              replacementTx.hash,
+              event,
+              blockDiff
+            );
+          }
+        } else {
+          if (dbTx.status === "preparing") {
+            console.log(
+              `Transaction ${dbTx.tx_hash} was not sent, preparing new transaction...`
+            );
+          } else if (dbTx.status === "pending") {
+            console.log(
+              `Transaction ${dbTx.tx_hash} was dropped, preparing new transaction...`
+            );
+          }
+          const nonce = Number(
+            await this.publicClient.getTransactionCount({
+              address: this.walletClient.account!.address,
+            })
+          );
+          console.log("nonce", nonce);
+          console.log("dbTx.nonce", dbTx.nonce);
+          if (nonce !== Number(dbTx.nonce)) {
+            throw new Error("Transaction has a different nonce, aborting");
+          }
+          try {
+            await this.waitAndReplaceNew(event, false, true);
+          } catch (error) {
+            console.error(`Error waiting for transaction: ${error}`);
+            throw error;
           }
         }
-
-       else {  if (dbTx.status === "preparing") {
-          console.log(
-            `Transaction ${dbTx.tx_hash} was not sent, preparing new transaction...`
-          );
-        } else if (dbTx.status === "pending") {
-          console.log(
-            `Transaction ${dbTx.tx_hash} was dropped, preparing new transaction...`
-          );
-        }
-        const nonce = await this.wallet.getNonce();
-        console.log("nonce", nonce);
-        console.log("dbTx.nonce", dbTx.nonce);
-        if (nonce !== Number(dbTx.nonce)) {
-          throw new Error("Transaction has a different nonce, aborting");
-        }
-        try {
-          await this.waitAndReplaceNew(event,false,true);
-        } catch (error) {
-          console.error(`Error waiting for transaction: ${error}`);
-          throw error;
-        }}
-      } else if (tx.blockNumber) {
-        console.log("TX   ", tx);
+      } else if (txReceipt?.blockNumber) {
+        console.log("TX   ", txReceipt);
         console.log(
           `Transaction ${dbTx.tx_hash} was mined, updating database...`
         );
+        const tx = await this.publicClient.getTransaction({
+          hash: dbTx.tx_hash as `0x${string}`,
+        });
         console.log("TX hash", tx.hash);
         console.log("TX nonce", tx.nonce);
         await this.db.confirmTransaction(tx.hash, tx.nonce);
         console.log("TX updated", event.pong_tx_nonce);
       } else {
         console.log(`Transaction ${dbTx.tx_hash} is still pending, waiting...`);
-        const blockDiff = currentBlock.number - dbTx.block_number!;
-        await this.processPendingTransaction(tx, event,blockDiff);
+        const blockDiff = Number(currentBlock) - dbTx.block_number!;
+        await this.processPendingTransaction(
+          txReceipt!.transactionHash,
+          event,
+          blockDiff
+        );
       }
     } catch (error) {
       console.error(`Error processing transaction: ${error}`);
@@ -333,21 +427,26 @@ class EventQueue {
   }
 
   async processPendingTransaction(
-    tx: ethers.TransactionResponse | ethers.ContractTransactionResponse,
+    txHash: string,
     event: QueuedPingEvent,
     blockDiff: number
   ) {
-    console.log("processing pending transaction", tx, event, blockDiff);
-    const currentBlock = await this.provider.getBlock("latest");
+    console.log("processing pending transaction", txHash, event, blockDiff);
+    const currentBlock = await this.publicClient.getBlockNumber();
     if (!currentBlock) throw new Error("Could not get current block");
     const receipt = await this.waitForTransactionWithTimeout(
-      tx,
-      blockDiff<this.BLOCK_THRESHOLD ? 12000*(this.BLOCK_THRESHOLD-blockDiff) : 0
+      txHash,
+      blockDiff < this.BLOCK_THRESHOLD
+        ? 12000 * (this.BLOCK_THRESHOLD - blockDiff)
+        : 0
     );
     if (receipt) {
+      const tx = await this.publicClient.getTransaction({
+        hash: txHash as `0x${string}`,
+      });
       await this.db.confirmTransaction(tx.hash, tx.nonce);
     } else {
-      console.log(`Transaction ${tx.hash} is stuck, sending replacement...`);
+      console.log(`Transaction ${txHash} is stuck, sending replacement...`);
       await this.waitAndReplaceNew(event, true);
     }
   }
@@ -381,62 +480,74 @@ class EventQueue {
    */
   private async populateTransaction(
     pingTxHash: string,
-    overrides: ethers.Overrides = {}
-  ): Promise<ethers.TransactionResponse> {
+    overrides: { gasPrice?: bigint } = {}
+  ): Promise<`0x02${string}`> {
     try {
       // Get the contract address
-      const contractAddress = await this.contract.getAddress();
+      const contractAddress = process.env.CONTRACT_ADDRESS! as `0x${string}`;
 
-      // Create transaction data manually using the interface
-      const data = this.contract.interface.encodeFunctionData("pong", [
-        pingTxHash,
-      ]);
+      // Encode function data for 'pong' using viem
+      const data = encodeFunctionData({
+        abi,
+        functionName: "pong",
+        args: [pingTxHash as `0x${string}`],
+      });
 
-      // Get fee data for EIP-1559
-      const feeData = await this.provider.getFeeData();
-      if (!feeData.maxFeePerGas || !feeData.maxPriorityFeePerGas) {
-        throw new Error("Could not get fee data for EIP-1559");
-      }
+      // Get nonce from public client
+      const nonce = Number(
+        await this.publicClient.getTransactionCount({
+          address: this.walletClient.account!.address,
+        })
+      );
 
-      // Create the transaction request with EIP-1559 fields
-      const txRequest: ethers.TransactionRequest = {
+      // Get latest block for fee estimation
+      const block = await this.publicClient.getBlock();
+
+      // Calculate fees based on overrides or block data
+      const maxFeePerGas = overrides.gasPrice
+        ? overrides.gasPrice
+        : (block.baseFeePerGas || 10000000000n) * 2n;
+
+      const maxPriorityFeePerGas = overrides.gasPrice
+        ? overrides.gasPrice / 2n
+        : maxFeePerGas / 2n;
+
+      // Get gas estimate
+      const gasEstimate = await this.publicClient.estimateGas({
+        account: this.walletClient.account!.address,
         to: contractAddress,
         data,
-        type: 2, // EIP-1559
-        maxFeePerGas: overrides.gasPrice || feeData.maxFeePerGas,
-        maxPriorityFeePerGas: overrides.gasPrice || feeData.maxPriorityFeePerGas,
-        chainId: (await this.provider.getNetwork()).chainId
+        value: 0n,
+      });
+
+      // Add 20% buffer to gas estimate
+      const gas = (gasEstimate * 12n) / 10n;
+
+      console.log("gasLimit", gas);
+      // Get chain id
+      const chainId = this.publicClient.chain?.id || 11155111; // Default to Sepolia if not available
+
+      // Prepare transaction request
+      const txRequest = {
+        to: contractAddress,
+        data,
+        nonce,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+        gas,
+        type: "eip1559" as const,
+        chainId,
+        value: 0n,
       };
 
-      // Add missing transaction fields
-      if (!txRequest.gasLimit) {
-        const estimatedGas = await this.provider.estimateGas({
-          to: contractAddress,
-          data: data,
-          from: this.ourAddress,
-        });
-        txRequest.gasLimit = (estimatedGas * 12n) / 10n; // Add 20% buffer
-      }
-
-      if (!txRequest.nonce) {
-        txRequest.nonce = await this.wallet.getNonce();
-      }
-
-      // Let the wallet populate the transaction to match exactly what will be sent
-      const populatedTx = await this.wallet.populateTransaction(txRequest);
-      
-      // Get the actual transaction hash that will match the sent transaction
-      const signedTx = await this.wallet.signTransaction(populatedTx);
-      const tx = ethers.Transaction.from(signedTx);
-
-      return {
-        ...populatedTx,
-        hash: tx.hash,
-        wait: async () => {
-          throw new Error("Transaction not sent yet");
-        },
-        confirmations: 0,
-      } as unknown as ethers.TransactionResponse;
+      // Sign transaction to get hash
+      const signedTx = await this.walletClient.signTransaction({
+        chain: this.publicClient.chain,
+        account: this.walletClient.account!,
+        ...txRequest,
+      });
+      // Return transaction response-like object with viem types
+      return signedTx;
     } catch (error) {
       console.error("Error populating transaction:", error);
       throw error;
