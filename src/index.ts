@@ -1,23 +1,20 @@
 import dotenv from "dotenv";
-import { Pool } from "pg";
 import EventQueue from "./queue";
-import { Database } from "./db";
 
 // Load environment variables
 dotenv.config();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+
 
 async function main() {
   try {
     // Initialize database and event queue
-    const db = new Database(pool);
-    const eventQueue = new EventQueue(db);
+
+    const eventQueue = new EventQueue();
     await eventQueue.initialize();
     eventQueue.processQueue();
 
     // Start listening for new events
+    eventQueue.blockWatcher();
     await eventQueue.startListening();
 
     // Handle graceful shutdown
