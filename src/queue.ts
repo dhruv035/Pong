@@ -187,10 +187,17 @@ class EventQueue {
   }
   blockWatcher() {
     this.provider.on("block", async (blockNumber) => {
+      
       console.log("blockWatcher", blockNumber, this.lastBlock);
       if (this.lastBlock === -1) {
         return;
       }
+      const pingEvent = await this.db.getPingEvent(this.blockingNonce);
+        if (!pingEvent) {
+          this.blockingNonce = -1;
+          this.lastBlock = -1;
+          return;
+        }
       const nonce = await this.provider.getTransactionCount(this.ourAddress);
       console.log("nonce, blockingNonce", nonce, this.blockingNonce);
       if (this.blockingNonce > nonce) {
@@ -200,12 +207,7 @@ class EventQueue {
         return;
       }
       if (blockNumber - this.lastBlock > this.BLOCK_THRESHOLD) {
-        const pingEvent = await this.db.getPingEvent(this.blockingNonce);
-        if (!pingEvent) {
-          this.blockingNonce = -1;
-          this.lastBlock = -1;
-          return;
-        }
+        
 
         const dbTx = await this.db.getPongTransaction(this.blockingNonce);
         let tx: ethers.TransactionResponse | undefined;
