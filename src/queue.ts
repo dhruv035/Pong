@@ -84,6 +84,7 @@ class EventQueue {
       await this.cleanup();
       console.log("Event listener stopped successfully");
     }
+    await this.db.shutDown();
   }
 
   async addEvent(event: QueuedPingEvent) {

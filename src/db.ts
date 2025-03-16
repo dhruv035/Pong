@@ -10,6 +10,9 @@ export class Database {
     });
   }
 
+  async shutDown() {
+    await this.pool.end();
+  }
   private async withClient<T>(
     operation: (client: PoolClient) => Promise<T>
   ): Promise<T> {
