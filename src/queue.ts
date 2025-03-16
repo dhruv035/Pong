@@ -484,9 +484,6 @@ class EventQueue {
         txRequest.gasLimit = estimatedGas; // Add 20% buffer
       }
 
-      if (txRequest.nonce !== 0 && !txRequest.nonce) {
-        throw new Error("Nonce is required");
-      }
 
       // Let the wallet populate the transaction to match exactly what will be sent
       const populatedTx = await this.wallet.populateTransaction(txRequest);
