@@ -251,6 +251,11 @@ class EventQueue {
 
       const tx = await this.provider.getTransaction(dbTx.tx_hash);
       if (!tx) {
+        const nonce = await this.provider.getTransactionCount(this.ourAddress);
+        if (event.pong_tx_nonce > nonce) {
+          console.log("Nonce is greater than the current nonce, skipping");
+          return;
+        }
         const newTx = await this.sendPong(event, true, true);
         if (!newTx) throw new Error("Transaction not found");
         newTx
