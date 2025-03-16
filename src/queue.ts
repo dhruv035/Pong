@@ -170,9 +170,9 @@ class EventQueue {
     return tx;
   }
   async updateBlockingNonce(blockNumber: number, nonce: number) {
-    if (nonce === this.blockingNonce) {
-        this.blockingNonce += 1;
-        this.lastBlock = blockNumber;
+    if (nonce >= this.blockingNonce) {
+      this.blockingNonce = nonce+1;
+      this.lastBlock = blockNumber;
     }
   }
   blockWatcher() {
