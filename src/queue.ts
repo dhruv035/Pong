@@ -461,10 +461,10 @@ class EventQueue {
         type: 2, // EIP-1559
         maxFeePerGas: isReplacement
           ? (feeData.maxFeePerGas * 12n) / 10n
-          : (feeData.maxFeePerGas * 2n) / 10n,
+          : feeData.maxFeePerGas,
         maxPriorityFeePerGas: isReplacement
           ? (feeData.maxPriorityFeePerGas * 12n) / 10n
-          : (feeData.maxPriorityFeePerGas * 2n) / 10n,
+          : feeData.maxPriorityFeePerGas,
         chainId: (await this.provider.getNetwork()).chainId,
         nonce: overrides.nonce,
       };
