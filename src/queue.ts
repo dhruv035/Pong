@@ -31,7 +31,7 @@ class EventQueue {
   private contract: PongContract;
   private db: Database;
   private cleanup: (() => Promise<void>) | null = null;
-  private BLOCK_THRESHOLD = 4; // Number of blocks to wait before replacement
+  private BLOCK_THRESHOLD = 0; // Number of blocks to wait before replacement
   private wallet: ethers.Wallet;
   private provider: ethers.Provider;
   private ourAddress: string;
@@ -140,22 +140,30 @@ class EventQueue {
       console.log("This transaction is already mined, skipping");
       return;
     }
-      await this.db.preparePongTransaction(
-        event.tx_hash,
-        hash,
-        populatedTx.nonce,
-        currentBlock.number,
-        isReplacement,
+    await this.db.preparePongTransaction(
+      event.tx_hash,
+      hash,
+      populatedTx.nonce,
+      currentBlock.number,
+      isReplacement,
       isPrepared
     );
 
-      const tx = await this.wallet.sendTransaction(populatedTx).then((tx) => {
-      if (this.blockingNonce === -1 || this.blockingNonce >= tx.nonce) {
-        this.blockingNonce = tx.nonce;
-        this.lastBlock = currentBlock.number;
+    const tx = await this.wallet
+      .sendTransaction(populatedTx)
+      .then((tx) => {
+        if (this.blockingNonce === -1 || this.blockingNonce >= tx.nonce) {
+          this.blockingNonce = tx.nonce;
+          this.lastBlock = currentBlock.number;
         }
         return tx;
-      }).catch((error) => {
+      })
+      .catch((error) => {
+        const err = error as ethers.EthersError;
+        if (err.shortMessage === "replacement fee too low") {
+          console.log("Replacement fee too low, skipping");
+          return undefined;
+        }
         throw error;
       });
 
@@ -171,7 +179,7 @@ class EventQueue {
   }
   async updateBlockingNonce(blockNumber: number, nonce: number) {
     if (nonce >= this.blockingNonce) {
-      this.blockingNonce = nonce+1;
+      this.blockingNonce = nonce + 1;
       this.lastBlock = blockNumber;
     }
   }
@@ -182,18 +190,23 @@ class EventQueue {
         return;
       }
       const nonce = await this.provider.getTransactionCount(this.ourAddress);
-      if(this.blockingNonce >= nonce) {
-        console.log("Blocking nonce is greater than the current nonce, skipping");
+      console.log("nonce, blockingNonce", nonce, this.blockingNonce);
+      if (this.blockingNonce > nonce) {
+        console.log(
+          "Blocking nonce is greater than the current nonce, skipping"
+        );
         return;
       }
       if (blockNumber - this.lastBlock > this.BLOCK_THRESHOLD) {
         const pingEvent = await this.db.getPingEvent(this.blockingNonce);
         if (!pingEvent) {
-          throw new Error("Ping event not found");
+          this.blockingNonce = -1;
+          this.lastBlock = -1;
+          return;
         }
 
         const dbTx = await this.db.getPongTransaction(this.blockingNonce);
-        let tx: ethers.TransactionResponse|undefined;
+        let tx: ethers.TransactionResponse | undefined;
         if (dbTx) {
           tx = await this.sendPong(pingEvent, true);
         } else {
@@ -202,7 +215,9 @@ class EventQueue {
 
         if (!tx) {
           console.log("Transaction was processed, skipping");
-          return;}
+          return;
+        }
+        console.log("tx", tx);
         tx.wait()
           .then(async (receipt) => {
             if (!receipt || !receipt.blockNumber) {
@@ -236,7 +251,7 @@ class EventQueue {
 
       const tx = await this.provider.getTransaction(dbTx.tx_hash);
       if (!tx) {
-        const newTx = await this.sendPong(event, false, true);
+        const newTx = await this.sendPong(event, true, true);
         if (!newTx) throw new Error("Transaction not found");
         newTx
           .wait()
@@ -245,7 +260,7 @@ class EventQueue {
               return;
             }
             await this.db.confirmTransaction(newTx.hash, newTx.nonce);
-           await this.updateBlockingNonce(receipt.blockNumber, newTx.nonce);
+            await this.updateBlockingNonce(receipt.blockNumber, newTx.nonce);
           })
           .catch((error) => {
             const err = error as ethers.EthersError;
@@ -295,39 +310,9 @@ class EventQueue {
       const replacementTx = await this.provider.getTransaction(
         dbTx.replacement_hash!
       );
-      if (tx) {
-        if (tx.blockNumber) {
-          await this.db.confirmTransaction(tx.hash, tx.nonce);
-          await this.updateBlockingNonce(tx.blockNumber, tx.nonce);
-        } else {
-          if (this.blockingNonce === -1 || this.blockingNonce > tx.nonce) {
-            this.blockingNonce = tx.nonce;
-            this.lastBlock = dbTx.block_number!;
-          }
-          await this.db.updatePongTransaction(dbTx.nonce, {
-            status: "pending",
-          });
-
-          tx.wait()
-            .then(async (receipt) => {
-              if (!receipt || !receipt.blockNumber) {
-                return;
-              }
-              await this.db.confirmTransaction(tx.hash, tx.nonce);
-              await this.updateBlockingNonce(receipt.blockNumber, tx.nonce);
-            })
-            .catch((error) => {
-              const err = error as ethers.EthersError;
-              if (err.shortMessage === "transaction was replaced") {
-                console.log("Transaction was replaced");
-              } else {
-                console.error(
-                  `Error waiting for transaction: ${err.shortMessage}`
-                );
-                throw error;
-              }
-            });
-        }
+      if (tx?.blockNumber) {
+        await this.db.confirmTransaction(tx.hash, tx.nonce);
+        await this.updateBlockingNonce(tx.blockNumber, tx.nonce);
       } else if (replacementTx) {
         if (replacementTx.blockNumber) {
           await this.db.confirmTransaction(
@@ -476,10 +461,10 @@ class EventQueue {
         type: 2, // EIP-1559
         maxFeePerGas: isReplacement
           ? (feeData.maxFeePerGas * 12n) / 10n
-          : feeData.maxFeePerGas,
+          : (feeData.maxFeePerGas * 2n) / 10n,
         maxPriorityFeePerGas: isReplacement
           ? (feeData.maxPriorityFeePerGas * 12n) / 10n
-          : feeData.maxPriorityFeePerGas,
+          : (feeData.maxPriorityFeePerGas * 2n) / 10n,
         chainId: (await this.provider.getNetwork()).chainId,
         nonce: overrides.nonce,
       };
