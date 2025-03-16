@@ -4,8 +4,10 @@ import { PongTransaction, QueuedPingEvent } from "./queue";
 export class Database {
   private pool: Pool;
 
-  constructor(pool: Pool) {
-    this.pool = pool;
+  constructor() {
+    this.pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+    });
   }
 
   private async withClient<T>(
@@ -54,6 +56,17 @@ export class Database {
     return this.withClient(async (client) => {
       const result = await client.query<PongTransaction>(
         "SELECT * FROM pong_transactions WHERE nonce = $1",
+        [nonce]
+      );
+      if (result.rows.length == 0) return null;
+      return result.rows[0];
+    });
+  }
+
+  async getPingEvent(nonce: number): Promise<QueuedPingEvent | null> {
+    return this.withClient(async (client) => {
+      const result = await client.query<QueuedPingEvent>(
+        "SELECT * FROM ping_events WHERE pong_tx_nonce = $1",
         [nonce]
       );
       if (result.rows.length == 0) return null;
@@ -115,11 +128,11 @@ export class Database {
           "INSERT INTO pong_transactions (tx_hash, nonce, block_number, ping_hash, status) VALUES ($1, $2, $3, $4, $5)",
           [pongTxHash, nonce, blockNumber, pingTxHash, "preparing"]
         );
-        await client.query(
-          "UPDATE ping_events SET pong_tx_nonce = $1 WHERE tx_hash = $2",
-          [nonce, pingTxHash]
-        );
       }
+      await client.query(
+        "UPDATE ping_events SET pong_tx_nonce = $1 WHERE tx_hash = $2",
+        [nonce, pingTxHash]
+      );
     });
   }
 
