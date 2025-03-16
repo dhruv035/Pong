@@ -31,7 +31,7 @@ class EventQueue {
   private contract: PongContract;
   private db: Database;
   private cleanup: (() => Promise<void>) | null = null;
-  private BLOCK_THRESHOLD = 0; // Number of blocks to wait before replacement
+  private BLOCK_THRESHOLD = 4; // Number of blocks to wait before replacement
   private wallet: ethers.Wallet;
   private provider: ethers.Provider;
   private ourAddress: string;
