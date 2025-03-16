@@ -124,7 +124,9 @@ class EventQueue {
       isReplacement
     );
     if (!populatedTx.nonce) {
-      throw new Error("Nonce is required");
+      if (populatedTx.nonce !== 0) {
+        throw new Error("Nonce is required");
+      }
     }
     let currentBlock: ethers.Block | undefined;
     do {
