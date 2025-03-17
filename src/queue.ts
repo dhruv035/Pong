@@ -58,6 +58,7 @@ class EventQueue {
   }
 
   async initialize() {
+    await this.db.initialize();
     this.queue = await this.db.getUnprocessedEvents();
   }
 

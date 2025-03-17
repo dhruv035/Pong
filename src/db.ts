@@ -12,12 +12,18 @@ export class Database {
     this.listenerClient = new Client({
       connectionString: process.env.DATABASE_URL,
     });
+    
+  }
+
+  async initialize() {
+    await this.listenerClient.connect();
   }
 
   async shutDown() {
     await this.pool.end();
     await this.listenerClient.end();
   }
+  
   private async withClient<T>(
     operation: (client: PoolClient) => Promise<T>
   ): Promise<T> {

@@ -15,7 +15,7 @@ async function main() {
 
     // Start listening for new events
     eventQueue.blockWatcher();
-    await eventQueue.startListening();
+    eventQueue.startListening();
 
     // Handle graceful shutdown
     process.on("SIGINT", async () => {
