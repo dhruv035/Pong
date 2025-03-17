@@ -1,17 +1,22 @@
-import { Pool, PoolClient, Notification } from "pg";
+import { Pool, PoolClient, Notification, Client } from "pg";
 import { PongTransaction, QueuedPingEvent } from "./queue";
 
 export class Database {
   private pool: Pool;
+  private listenerClient:Client;
 
   constructor() {
     this.pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+    });
+    this.listenerClient = new Client({
       connectionString: process.env.DATABASE_URL,
     });
   }
 
   async shutDown() {
     await this.pool.end();
+    await this.listenerClient.end();
   }
   private async withClient<T>(
     operation: (client: PoolClient) => Promise<T>
@@ -169,13 +174,12 @@ export class Database {
 
   async setupNotificationListener(
     onNotification: (payload: QueuedPingEvent) => void
-  ): Promise<{ client: PoolClient; cleanup: () => Promise<void> }> {
-    const client = await this.pool.connect();
+  ): Promise<{ cleanup: () => Promise<void> }> {
     try {
-      await client.query("LISTEN ping_events");
+      await this.listenerClient.query("LISTEN ping_events");
 
       // Using any here because pg types don't properly expose the notification event
-      (client as any).on("notification", (msg: Notification) => {
+      this.listenerClient.on("notification", (msg: Notification) => {
         try {
           if (!msg.payload) {
             console.error("Received notification without payload");
@@ -190,16 +194,14 @@ export class Database {
 
       const cleanup = async () => {
         try {
-          await client.query("UNLISTEN ping_events");
-          client.release();
+          await this.listenerClient.query("UNLISTEN ping_events");
         } catch (error) {
           console.error("Error cleaning up listener:", error);
         }
       };
 
-      return { client, cleanup };
+      return { cleanup };
     } catch (error) {
-      client.release();
       throw error;
     }
   }
